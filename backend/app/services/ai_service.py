@@ -77,9 +77,13 @@ class HostedGemmaProvider(BaseAIProvider):
     Compatible with Groq, OpenRouter, Together AI, Anyscale, vLLM, and TGI.
     """
     def __init__(self, base_url: str, api_key: str, model_name: str = "gemma-2-9b-it"):
-        self.base_url = (base_url or "").rstrip("/")
-        self.api_key = (api_key or "").strip()
-        self.model_name = (model_name or "gemma-2-9b-it").strip()
+        self.base_url = (base_url or "").strip().strip('"').strip("'").rstrip("/")
+        # Sanitize API key: strip whitespace, surrounding quotes, and redundant 'Bearer ' prefix
+        clean_key = (api_key or "").strip().strip('"').strip("'")
+        if clean_key.lower().startswith("bearer "):
+            clean_key = clean_key[7:].strip().strip('"').strip("'")
+        self.api_key = clean_key
+        self.model_name = (model_name or "gemma-2-9b-it").strip().strip('"').strip("'")
 
     @property
     def provider_name(self) -> str:
@@ -97,9 +101,15 @@ class HostedGemmaProvider(BaseAIProvider):
         if not self.base_url or not self.api_key:
             raise ValueError("Hosted Gemma is not configured: missing base URL or API key.")
 
+        clean_key = (self.api_key or "").strip().strip('"').strip("'")
+        if clean_key.lower().startswith("bearer "):
+            clean_key = clean_key[7:].strip().strip('"').strip("'")
+
         headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
+            "Authorization": f"Bearer {clean_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://buddylens-ai-3.onrender.com",
+            "X-Title": "BuddyLens AI"
         }
         messages = []
         if system_prompt:
@@ -114,12 +124,21 @@ class HostedGemmaProvider(BaseAIProvider):
 
         url = f"{self.base_url}/chat/completions" if not self.base_url.endswith("/chat/completions") else self.base_url
 
+        # Retry up to 3 attempts on transient 429 rate limit or 503 service unavailable
+        max_attempts = 3
         async with httpx.AsyncClient(timeout=45.0) as client:
-            res = await client.post(url, headers=headers, json=payload)
-            if res.status_code != 200:
-                raise RuntimeError(f"Hosted API error {res.status_code}: {res.text}")
-            data = res.json()
-            return data["choices"][0]["message"]["content"].strip()
+            for attempt in range(1, max_attempts + 1):
+                res = await client.post(url, headers=headers, json=payload)
+                if res.status_code == 200:
+                    data = res.json()
+                    return data["choices"][0]["message"]["content"].strip()
+                elif res.status_code in (429, 503) and attempt < max_attempts:
+                    import asyncio
+                    logger.warning(f"Hosted API returned {res.status_code} on attempt {attempt}/{max_attempts}. Retrying in 1.5s...")
+                    await asyncio.sleep(1.5)
+                    continue
+                else:
+                    raise RuntimeError(f"Hosted API error {res.status_code}: {res.text}")
 
 
 class DeterministicRuleFallbackProvider(BaseAIProvider):
